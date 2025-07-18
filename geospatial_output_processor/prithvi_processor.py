@@ -3,6 +3,7 @@ from typing import Any
 from einops import rearrange
 import torch
 import rasterio
+import numpy as np
 
 def save_geotiff(image, output_path: str, meta: dict):
     """Save multi-band image in Geotiff file.
@@ -62,6 +63,9 @@ class PrithviOutputProcessor(HiddenStatesProcessor):
 
         #create temp file
         file_path = "/workspace/file_test_output_processor.tiff"
-
-        save_geotiff(_convert_np_uint8(pred_imgs), file_path, {})
+        meta_data = {'driver': 'GTiff', 'dtype': 'uint8', 'nodata': 0,
+                     'width': 512, 'height': 512, 'count': 1,
+                     'compress': 'lzw',
+                     }
+        save_geotiff(_convert_np_uint8(pred_imgs), file_path, meta_data)
     
