@@ -1,0 +1,13 @@
+[project]
+name = "prithvi-hidden-states-processors"
+description = "vLLM plugin for Hidden States Processor"
+dynamic = ["version"]
+
+[project.entry-points."vllm.hidden_states_processor_plugins"]
+prithvi_to_tiff = "geospatial_output_processor:register_prithvi"
+
+[tool.setuptools.packages.find]
+where = ["."]  # list of folders that contain the packages (["."] by default)
+include = ["geospatial_output_processor*"]  # package names should match these glob patterns (["*"] by default)
+exclude = []  # exclude packages matching these glob patterns (empty by default)
+namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
