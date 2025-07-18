@@ -1,4 +1,4 @@
-from vllm.v1.engine.hidden_states_processor import HiddenStatesProcessor
+from vllm.plugins.hidden_states_processors.interface import HiddenStatesProcessor
 from typing import Any
 from einops import rearrange
 import torch
@@ -68,4 +68,5 @@ class PrithviOutputProcessor(HiddenStatesProcessor):
                      'compress': 'lzw',
                      }
         save_geotiff(_convert_np_uint8(pred_imgs), file_path, meta_data)
-    
+
+        return file_path
