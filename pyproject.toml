@@ -3,7 +3,7 @@ name = "prithvi-hidden-states-processors"
 description = "vLLM plugin for Hidden States Processor"
 dynamic = ["version"]
 
-[project.entry-points."vllm.hidden_states_processor_plugins"]
+[project.entry-points."vllm.multimodal_data_processor_plugins"]
 prithvi_to_tiff = "geospatial_output_processor:register_prithvi"
 
 [tool.setuptools.packages.find]
