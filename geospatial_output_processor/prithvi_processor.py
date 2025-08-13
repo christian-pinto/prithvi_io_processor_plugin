@@ -245,7 +245,6 @@ class PrithviOutputProcessor(MultimodalDataProcessor):
     def post_process(self,
                     model_out: list[Optional[PoolingRequestOutput]],
                     request_id: Optional[str] = None, ) -> MultiModalRequestOutput:
-        print("This is the Geospatial plugin hidden states processor:")            
 
         pred_imgs = []
         for output in model_out:

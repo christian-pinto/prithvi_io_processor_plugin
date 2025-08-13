@@ -1,6 +1,6 @@
 [project]
-name = "prithvi-hidden-states-processors"
-description = "vLLM plugin for Hidden States Processor"
+name = "prithvi-multimodal-data-procesor"
+description = "vLLM plugin for Multimodal Data Processing"
 dynamic = ["version"]
 
 [project.entry-points."vllm.multimodal_data_processor_plugins"]
