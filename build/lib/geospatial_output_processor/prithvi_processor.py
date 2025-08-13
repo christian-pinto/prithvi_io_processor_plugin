@@ -4,7 +4,7 @@ from einops import rearrange
 import numpy as np
 import rasterio
 import torch
-from typing import Any, List, Optional, Union
+from typing import List, Optional, Union
 from vllm.inputs.data import MultiModalPromptType, PromptType
 from vllm.outputs import PoolingRequestOutput
 from vllm.plugins.multimodal_data_processors.interface import MultimodalDataProcessor
@@ -12,6 +12,8 @@ from terratorch.datamodules import Sen1Floods11NonGeoDataModule
 from vllm.config import VllmConfig
 from vllm.outputs import MultiModalRequestOutput, ImageRequestOutput
 import albumentations
+import tempfile
+import os
 
 NO_DATA = -9999
 NO_DATA_FLOAT = 0.0001
@@ -19,6 +21,7 @@ OFFSET = 0
 PERCENTILE = 99
 
 DEFAULT_INPUT_INDICES = [1, 2, 3, 8, 11, 12]
+# DEFAULT_INPUT_INDICES = [0, 1, 2, 3, 4, 5]
 
 datamodule_config = {
     "bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
@@ -47,7 +50,6 @@ def save_geotiff(image, output_path: str, meta: dict):
         output_path: path where to save the image
         meta: dict with meta info.
     """
-
     with rasterio.open(output_path, "w", **meta) as dest:
         for i in range(image.shape[0]):
             dest.write(image[i, :, :], i + 1)
@@ -60,7 +62,7 @@ def _convert_np_uint8(float_image: torch.Tensor):
 
     return image
 
-def read_geotiff(file_path: str):
+def read_geotiff(file_path: str, path_type: str):
     """Read all bands from *file_path* and return image + meta info.
 
     Args:
@@ -71,7 +73,16 @@ def read_geotiff(file_path: str):
         meta info dict
     """
 
-    with rasterio.open(file_path) as src:
+    if path_type == "url":
+        import urllib, tempfile
+        resp = urllib.request.urlopen(file_path)
+        tempfile = tempfile.NamedTemporaryFile()
+        tempfile.write(resp.read())
+        path = tempfile.name
+    else:
+        path = file_path
+
+    with rasterio.open(path) as src:
         img = src.read()
         meta = src.meta
         try:
@@ -84,6 +95,7 @@ def read_geotiff(file_path: str):
 
 def load_image(
     file_paths: list[str],
+    path_type: str,
     mean: list[float] = None,
     std: list[float] = None,
     indices: Union[list[int], None] = None,
@@ -108,7 +120,7 @@ def load_image(
     location_coords = []
 
     for file in file_paths:
-        img, meta, coords = read_geotiff(file)
+        img, meta, coords = read_geotiff(file, path_type)
 
         # Rescaling (don't normalize on nodata)
         img = np.moveaxis(img, 0, -1)  # channels last for rescaling
@@ -165,7 +177,7 @@ class PrithviOutputProcessor(MultimodalDataProcessor):
         self.original_h = 512
         self.original_w = 512
         self.batch_size = 1
-        self.metadata = None
+        self.meta_data = None
         self.channels = None
 
     def pre_process(self, prompt: MultiModalPromptType,
@@ -175,6 +187,7 @@ class PrithviOutputProcessor(MultimodalDataProcessor):
         input_data, temporal_coords, location_coords, meta_data = load_image(
             file_paths=[prompt["data"]],
             indices=DEFAULT_INPUT_INDICES,
+            path_type=prompt["type"]
         )
 
         self.meta_data = meta_data[0]
@@ -236,15 +249,20 @@ class PrithviOutputProcessor(MultimodalDataProcessor):
                     request_id: Optional[str] = None, ) -> MultiModalRequestOutput:
         print("This is the Geospatial plugin hidden states processor:")            
 
-        y_hat = model_out[0].outputs.data.argmax(dim=1)
-        pred = torch.nn.functional.interpolate(y_hat.unsqueeze(1).float(),
+        pred_imgs = []
+        for output in model_out:
+            y_hat = output.outputs.data.argmax(dim=1)
+            pred = torch.nn.functional.interpolate(y_hat.unsqueeze(1).float(),
                                                size=self.img_size,
                                                mode="nearest",)
+            pred_imgs.append(pred) 
 
-        
+
+        pred_imgs = torch.concat(pred_imgs, dim=0)
+
         # Build images from patches
         pred_imgs = rearrange(
-            pred,
+            pred_imgs,
             "(b h1 w1) c h w -> b c (h1 h) (w1 w)",
             h=self.img_size,
             w=self.img_size,
@@ -262,11 +280,9 @@ class PrithviOutputProcessor(MultimodalDataProcessor):
         pred_imgs = pred_imgs[0]
 
         #create temp file
-        file_path = "/workspace/vllm_max/file_test_output_processor.tiff"
-        meta_data = {'driver': 'GTiff', 'dtype': 'uint8', 'nodata': 0,
-                     'width': 512, 'height': 512, 'count': 1,
-                     'compress': 'lzw',
-                     }
-        save_geotiff(_convert_np_uint8(pred_imgs), file_path, meta_data)
+        file_path = os.path.join(os.getcwd(), "prediction.tiff")
+
+        self.meta_data.update(count=1, dtype="uint8", compress="lzw", nodata=0)
+        save_geotiff(_convert_np_uint8(pred_imgs), file_path, self.meta_data)
 
         return ImageRequestOutput(type="path", format="tiff", data=file_path)
