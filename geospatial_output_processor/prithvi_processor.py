@@ -4,16 +4,17 @@ from einops import rearrange
 import numpy as np
 import rasterio
 import torch
-from typing import List, Optional, Union
-from vllm.inputs.data import MultiModalPromptType, PromptType
+from typing import Optional, Union, Sequence
+from vllm.inputs.data import PromptType
 from vllm.outputs import PoolingRequestOutput
 from vllm.plugins.multimodal_data_processors.interface import MultimodalDataProcessor
+from vllm.plugins.multimodal_data_processors.types import ImagePrompt, MultiModalRequestOutput, ImageRequestOutput
 from terratorch.datamodules import Sen1Floods11NonGeoDataModule
 from vllm.config import VllmConfig
-from vllm.outputs import MultiModalRequestOutput, ImageRequestOutput
 import albumentations
 import urllib, tempfile
 import os
+import base64
 
 NO_DATA = -9999
 NO_DATA_FLOAT = 0.0001
@@ -41,7 +42,7 @@ datamodule_config = {
     ],
 }
 
-def save_geotiff(image, output_path: str, meta: dict):
+def save_geotiff(image, meta: dict, out_format: str) -> str:
     """Save multi-band image in Geotiff file.
 
     Args:
@@ -49,9 +50,22 @@ def save_geotiff(image, output_path: str, meta: dict):
         output_path: path where to save the image
         meta: dict with meta info.
     """
-    with rasterio.open(output_path, "w", **meta) as dest:
-        for i in range(image.shape[0]):
-            dest.write(image[i, :, :], i + 1)
+    if out_format == "path":
+        #create temp file
+        file_path = os.path.join(os.getcwd(), "prediction.tiff")
+        with rasterio.open(file_path, "w", **meta) as dest:
+            for i in range(image.shape[0]):
+                dest.write(image[i, :, :], i + 1)
+        
+        return file_path
+    elif out_format == "b64_json":
+        with tempfile.NamedTemporaryFile() as tmpfile:
+            with rasterio.open(tmpfile.name, "w", **meta) as dest:
+                for i in range(image.shape[0]):
+                    dest.write(image[i, :, :], i + 1)
+            
+            file_data = tmpfile.read()
+            return base64.b64encode(file_data)
 
     return
 
@@ -61,7 +75,7 @@ def _convert_np_uint8(float_image: torch.Tensor):
 
     return image
 
-def read_geotiff(file_path: str, path_type: str):
+def read_geotiff(file_path: str = None, path_type: str = None, file_data: bytes = None):
     """Read all bands from *file_path* and return image + meta info.
 
     Args:
@@ -72,13 +86,28 @@ def read_geotiff(file_path: str, path_type: str):
         meta info dict
     """
 
-    if path_type == "url":
+    if all([x == None for x in [file_path, path_type, file_data]]):
+        raise Exception("All input fields to read_geotiff are None")
+
+    if file_data is not None:
+        tmpfile = tempfile.NamedTemporaryFile()
+        tmpfile.write(file_data)
+        path = tmpfile.name
+    elif file_path is not None and path_type == "url":
         resp = urllib.request.urlopen(file_path)
-        tempfile = tempfile.NamedTemporaryFile()
-        tempfile.write(resp.read())
-        path = tempfile.name
-    else:
+        tmpfile = tempfile.NamedTemporaryFile()
+        tmpfile.write(resp.read())
+        path = tmpfile.name
+    elif file_path is not None and path_type == "path":
         path = file_path
+    elif file_path is not None and path_type == "b64_json":
+        image_data = base64.b64decode(file_path)
+        tmpfile = tempfile.NamedTemporaryFile()
+        tmpfile.write(image_data)
+        path = tmpfile.name
+    else:
+        raise Exception("Wrong combination of parameters to read_geotiff")
+    
 
     with rasterio.open(path) as src:
         img = src.read()
@@ -92,7 +121,7 @@ def read_geotiff(file_path: str, path_type: str):
     return img, meta, coords
 
 def load_image(
-    file_paths: list[str],
+    data: Union[list[str], list[bytes]],
     path_type: str,
     mean: list[float] = None,
     std: list[float] = None,
@@ -117,9 +146,11 @@ def load_image(
     temporal_coords = []
     location_coords = []
 
-    for file in file_paths:
-        img, meta, coords = read_geotiff(file, path_type)
-
+    for file in data:
+        if isinstance(file, bytes):
+            img, meta, coords = read_geotiff(file_data=file)
+        else:
+            img, meta, coords = read_geotiff(file_path=file, path_type=path_type)
         # Rescaling (don't normalize on nodata)
         img = np.moveaxis(img, 0, -1)  # channels last for rescaling
         if indices is not None:
@@ -177,15 +208,30 @@ class PrithviOutputProcessor(MultimodalDataProcessor):
         self.batch_size = 1
         self.meta_data = None
         self.channels = None
+        self.requests_cache: Dict[str, Any] = {}
 
-    def pre_process(self, prompt: MultiModalPromptType,
-                    request_id: Optional[str] = None,) -> List[PromptType]:
-        
+    def pre_process(
+        self,
+        prompts: Sequence[PromptType],
+        request_id: Optional[str] = None,
+        **kwargs,
+    ) -> Union[PromptType, Sequence[PromptType]]:
+
+        if isinstance(prompts, list):
+            # Convert a single prompt to a list.
+            prompts = prompts[0]
+
+        image_data = ImagePrompt(
+            **prompts["multi_modal_data"]["image"])
+
+        self.requests_cache[request_id] = {
+            "out_format": image_data["out_format"],
+        }
 
         input_data, temporal_coords, location_coords, meta_data = load_image(
-            file_paths=[prompt["data"]],
+            data=[image_data["data"]],
             indices=DEFAULT_INPUT_INDICES,
-            path_type=prompt["type"]
+            path_type=image_data["data_format"]
         )
 
         self.meta_data = meta_data[0]
@@ -235,18 +281,32 @@ class PrithviOutputProcessor(MultimodalDataProcessor):
                     "prompt_token_ids": [1],
                     "multi_modal_data": {
                         "pixel_values": window.to(torch.float16)[0],
-                        "location_coords": location_coords
+                        "location_coords": location_coords.to(torch.float16)
                     }
                 }
             )
 
         return prompts
+
+    async def pre_process_async(
+        self,
+        prompts: Union[PromptType, Sequence[PromptType]],
+        request_id: Optional[str] = None,
+        **kwargs,
+    ) -> Union[PromptType, Sequence[PromptType]]:
+        return self.pre_process(prompts, request_id, **kwargs)
     
-    def post_process(self,
-                    model_out: list[Optional[PoolingRequestOutput]],
-                    request_id: Optional[str] = None, ) -> MultiModalRequestOutput:
+    def post_process(
+        self,
+        model_out: Union[PromptType, Sequence[PromptType]],
+        request_id: Optional[str] = None,
+        **kwargs,
+    ) -> Sequence[MultiModalRequestOutput]:
 
         pred_imgs = []
+
+        out_format = self.requests_cache.get(request_id)["out_format"]
+
         for output in model_out:
             y_hat = output.outputs.data.argmax(dim=1)
             pred = torch.nn.functional.interpolate(y_hat.unsqueeze(1).float(),
@@ -276,10 +336,15 @@ class PrithviOutputProcessor(MultimodalDataProcessor):
         # Squeeze (batch size 1)
         pred_imgs = pred_imgs[0]
 
-        #create temp file
-        file_path = os.path.join(os.getcwd(), "prediction.tiff")
-
         self.meta_data.update(count=1, dtype="uint8", compress="lzw", nodata=0)
-        save_geotiff(_convert_np_uint8(pred_imgs), file_path, self.meta_data)
+        out_data = save_geotiff(_convert_np_uint8(pred_imgs), self.meta_data, out_format)
 
-        return ImageRequestOutput(type="path", format="tiff", data=file_path)
+        return [ImageRequestOutput(type=out_format, format="tiff", data=out_data)]
+
+    async def post_process_async(
+        self,
+        model_out: Sequence[Optional[PoolingRequestOutput]],
+        request_id: Optional[str] = None,
+        **kwargs,
+    ) -> Sequence[MultiModalRequestOutput]:
+        return self.post_process(model_out, request_id, **kwargs)
