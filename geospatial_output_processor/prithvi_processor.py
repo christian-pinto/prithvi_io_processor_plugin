@@ -4,11 +4,12 @@ from einops import rearrange
 import numpy as np
 import rasterio
 import torch
-from typing import Optional, Union, Sequence
+from typing import Any, Optional, Union, Sequence
+from vllm.entrypoints.openai.protocol import IOProcessorPluginResponse, IOProcessorPluginRequest
 from vllm.inputs.data import PromptType
 from vllm.outputs import PoolingRequestOutput
-from vllm.plugins.multimodal_data_processors.interface import MultimodalDataProcessor
-from vllm.plugins.multimodal_data_processors.types import ImagePrompt, MultiModalRequestOutput, ImageRequestOutput
+from vllm.plugins.io_processors.interface import IOProcessor
+from .types import ImagePrompt, ImageRequestOutput
 from terratorch.datamodules import Sen1Floods11NonGeoDataModule
 from vllm.config import VllmConfig
 import albumentations
@@ -21,7 +22,8 @@ NO_DATA_FLOAT = 0.0001
 OFFSET = 0
 PERCENTILE = 99
 
-DEFAULT_INPUT_INDICES = [1, 2, 3, 8, 11, 12]
+# DEFAULT_INPUT_INDICES = [1, 2, 3, 8, 11, 12]
+DEFAULT_INPUT_INDICES = [0,1,2,3,4,5]
 
 datamodule_config = {
     "bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
@@ -186,7 +188,7 @@ def load_image(
 
     return imgs, temporal_coords, location_coords, metas
 
-class PrithviOutputProcessor(MultimodalDataProcessor):
+class PrithviMultimodalDataProcessor(IOProcessor):
             
     def __init__(self, vllm_config: VllmConfig):
         
@@ -209,28 +211,49 @@ class PrithviOutputProcessor(MultimodalDataProcessor):
         self.meta_data = None
         self.channels = None
         self.requests_cache: Dict[str, Any] = {}
+        self.indices = DEFAULT_INPUT_INDICES
+
+    def parse_request(
+            self, request: Any) -> Optional[Any]:
+        if type(request) == dict:
+            image_prompt = ImagePrompt(**request)
+            return image_prompt
+        if isinstance(request, IOProcessorPluginRequest):
+            if not hasattr(request, "data"):
+                raise ValueError("missing 'data' field in OpenAIBaseModel Request")
+            
+            request_data = request.data
+
+            if type(request_data) == dict:
+                return ImagePrompt(**request_data)
+            else:
+                raise ValueError("Unable to parse the request data")
+            
+        
+        raise ValueError("Unable to parse request")
+
+    def plugin_out_to_response(self, plugin_out: Any) -> IOProcessorPluginResponse:
+        return IOProcessorPluginResponse(
+            request_id = plugin_out.request_id,
+            data=plugin_out,
+        )
 
     def pre_process(
         self,
-        prompts: Sequence[PromptType],
+        prompt: Any,
         request_id: Optional[str] = None,
         **kwargs,
     ) -> Union[PromptType, Sequence[PromptType]]:
 
-        if isinstance(prompts, list):
-            # Convert a single prompt to a list.
-            prompts = prompts[0]
-
-        image_data = ImagePrompt(
-            **prompts["multi_modal_data"]["image"])
+        image_data = dict(prompt)
 
         self.requests_cache[request_id] = {
-            "out_format": image_data["out_format"],
+            "out_format": image_data["out_data_format"],
         }
 
         input_data, temporal_coords, location_coords, meta_data = load_image(
             data=[image_data["data"]],
-            indices=DEFAULT_INPUT_INDICES,
+            indices=self.indices,
             path_type=image_data["data_format"]
         )
 
@@ -290,18 +313,18 @@ class PrithviOutputProcessor(MultimodalDataProcessor):
 
     async def pre_process_async(
         self,
-        prompts: Union[PromptType, Sequence[PromptType]],
+        prompt: Any,
         request_id: Optional[str] = None,
         **kwargs,
     ) -> Union[PromptType, Sequence[PromptType]]:
-        return self.pre_process(prompts, request_id, **kwargs)
+        return self.pre_process(prompt, request_id, **kwargs)
     
     def post_process(
         self,
-        model_out: Union[PromptType, Sequence[PromptType]],
+        model_out: Sequence[Optional[PoolingRequestOutput]],
         request_id: Optional[str] = None,
         **kwargs,
-    ) -> Sequence[MultiModalRequestOutput]:
+    ) -> Any:
 
         pred_imgs = []
 
@@ -339,12 +362,28 @@ class PrithviOutputProcessor(MultimodalDataProcessor):
         self.meta_data.update(count=1, dtype="uint8", compress="lzw", nodata=0)
         out_data = save_geotiff(_convert_np_uint8(pred_imgs), self.meta_data, out_format)
 
-        return [ImageRequestOutput(type=out_format, format="tiff", data=out_data)]
+        return ImageRequestOutput(type=out_format, format="tiff", data=out_data, request_id=request_id)
 
     async def post_process_async(
         self,
         model_out: Sequence[Optional[PoolingRequestOutput]],
         request_id: Optional[str] = None,
         **kwargs,
-    ) -> Sequence[MultiModalRequestOutput]:
+    ) -> Any:
         return self.post_process(model_out, request_id, **kwargs)
+
+class PrithviMultimodalDataProcessorIndia(PrithviMultimodalDataProcessor):
+
+    def __init__(self, vllm_config: VllmConfig):
+        
+        super().__init__(vllm_config)
+
+        self.indices = [1, 2, 3, 8, 11, 12]
+
+class PrithviMultimodalDataProcessorValencia(PrithviMultimodalDataProcessor):
+
+    def __init__(self, vllm_config: VllmConfig):
+        
+        super().__init__(vllm_config)
+        
+        self.indices = [0, 1, 2, 3, 4, 5]
