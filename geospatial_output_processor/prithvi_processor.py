@@ -1,50 +1,76 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from __future__ import annotations
+
+import base64
 import datetime
-import re
-from einops import rearrange
+import os
+import tempfile
+import urllib.request
+from collections.abc import Sequence
+from typing import Any, Optional, Union
+
+import albumentations
 import numpy as np
 import rasterio
+import regex as re
 import torch
-from typing import Any, Optional, Union, Sequence
-from vllm.entrypoints.openai.protocol import IOProcessorPluginResponse, IOProcessorPluginRequest
-from vllm.inputs.data import PromptType
-from vllm.outputs import PoolingRequestOutput
-from vllm.plugins.io_processors.interface import IOProcessor
-from .types import ImagePrompt, ImageRequestOutput
+from einops import rearrange
 from terratorch.datamodules import Sen1Floods11NonGeoDataModule
+
 from vllm.config import VllmConfig
-import albumentations
-import urllib, tempfile
-import os
-import base64
+from vllm.entrypoints.openai.protocol import (IOProcessorRequest,
+                                              IOProcessorResponse)
+from vllm.inputs.data import PromptType
+from vllm.logger import init_logger
+from vllm.outputs import PoolingRequestOutput
+from vllm.plugins.io_processors.interface import (IOProcessor,
+                                                  IOProcessorInput,
+                                                  IOProcessorOutput)
+
+from .types import DataModuleConfig, ImagePrompt, ImageRequestOutput
+
+logger = init_logger(__name__)
 
 NO_DATA = -9999
 NO_DATA_FLOAT = 0.0001
 OFFSET = 0
 PERCENTILE = 99
 
-# DEFAULT_INPUT_INDICES = [1, 2, 3, 8, 11, 12]
-DEFAULT_INPUT_INDICES = [0,1,2,3,4,5]
+DEFAULT_INPUT_INDICES = [0, 1, 2, 3, 4, 5]
 
-datamodule_config = {
+datamodule_config: DataModuleConfig = {
     "bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
-    "batch_size": 16,
-    "constant_scale": 0.0001,
-    "data_root": "/dccstor/geofm-finetuning/datasets/sen1floods11",
-    "drop_last": True,
-    "no_data_replace": 0.0,
-    "no_label_replace": -1,
-    "num_workers": 8,
+    "batch_size":
+    16,
+    "constant_scale":
+    0.0001,
+    "data_root":
+    "/dccstor/geofm-finetuning/datasets/sen1floods11",
+    "drop_last":
+    True,
+    "no_data_replace":
+    0.0,
+    "no_label_replace":
+    -1,
+    "num_workers":
+    8,
     "test_transform": [
-        albumentations.Resize(
-            always_apply=False, height=448, interpolation=1, p=1, width=448
-        ),
-        albumentations.pytorch.ToTensorV2(
-            transpose_mask=False, always_apply=True, p=1.0
-        ),
+        albumentations.Resize(always_apply=False,
+                              height=448,
+                              interpolation=1,
+                              p=1,
+                              width=448),
+        albumentations.pytorch.ToTensorV2(transpose_mask=False,
+                                          always_apply=True,
+                                          p=1.0),
     ],
 }
 
-def save_geotiff(image, meta: dict, out_format: str) -> str:
+
+def save_geotiff(image: torch.Tensor, meta: dict,
+                 out_format: str) -> str | bytes:
     """Save multi-band image in Geotiff file.
 
     Args:
@@ -53,23 +79,25 @@ def save_geotiff(image, meta: dict, out_format: str) -> str:
         meta: dict with meta info.
     """
     if out_format == "path":
-        #create temp file
+        # create temp file
         file_path = os.path.join(os.getcwd(), "prediction.tiff")
         with rasterio.open(file_path, "w", **meta) as dest:
             for i in range(image.shape[0]):
                 dest.write(image[i, :, :], i + 1)
-        
+
         return file_path
     elif out_format == "b64_json":
         with tempfile.NamedTemporaryFile() as tmpfile:
             with rasterio.open(tmpfile.name, "w", **meta) as dest:
                 for i in range(image.shape[0]):
                     dest.write(image[i, :, :], i + 1)
-            
+
             file_data = tmpfile.read()
             return base64.b64encode(file_data)
 
-    return
+    else:
+        raise ValueError("Unknown output format")
+
 
 def _convert_np_uint8(float_image: torch.Tensor):
     image = float_image.numpy() * 255.0
@@ -77,7 +105,12 @@ def _convert_np_uint8(float_image: torch.Tensor):
 
     return image
 
-def read_geotiff(file_path: str = None, path_type: str = None, file_data: bytes = None):
+
+def read_geotiff(
+    file_path: Optional[str] = None,
+    path_type: Optional[str] = None,
+    file_data: Optional[bytes] = None,
+) -> tuple[torch.Tensor, dict, tuple[float, float] | None]:
     """Read all bands from *file_path* and return image + meta info.
 
     Args:
@@ -88,46 +121,59 @@ def read_geotiff(file_path: str = None, path_type: str = None, file_data: bytes 
         meta info dict
     """
 
-    if all([x == None for x in [file_path, path_type, file_data]]):
+    if all([x is None for x in [file_path, path_type, file_data]]):
         raise Exception("All input fields to read_geotiff are None")
-
+    write_to_file: Optional[bytes] = None
+    path: Optional[str] = None
     if file_data is not None:
-        tmpfile = tempfile.NamedTemporaryFile()
-        tmpfile.write(file_data)
-        path = tmpfile.name
+        # with tempfile.NamedTemporaryFile() as tmpfile:
+        #     tmpfile.write(file_data)
+        #     path = tmpfile.name
+
+        write_to_file = file_data
     elif file_path is not None and path_type == "url":
         resp = urllib.request.urlopen(file_path)
-        tmpfile = tempfile.NamedTemporaryFile()
-        tmpfile.write(resp.read())
-        path = tmpfile.name
+        # with tempfile.NamedTemporaryFile() as tmpfile:
+        #     tmpfile.write(resp.read())
+        #     path = tmpfile.name
+        write_to_file = resp.read()
     elif file_path is not None and path_type == "path":
         path = file_path
     elif file_path is not None and path_type == "b64_json":
         image_data = base64.b64decode(file_path)
-        tmpfile = tempfile.NamedTemporaryFile()
-        tmpfile.write(image_data)
-        path = tmpfile.name
+        # with tempfile.NamedTemporaryFile() as tmpfile:
+        #     tmpfile.write(image_data)
+        #     path = tmpfile.name
+        write_to_file = image_data
     else:
         raise Exception("Wrong combination of parameters to read_geotiff")
-    
 
-    with rasterio.open(path) as src:
-        img = src.read()
-        meta = src.meta
-        try:
-            coords = src.lnglat()
-        except Exception:
-            # Cannot read coords
-            coords = None
+    with tempfile.NamedTemporaryFile() as tmpfile:
+        path_to_use = None
+        if write_to_file:
+            tmpfile.write(write_to_file)
+            path_to_use = tmpfile.name
+        elif path:
+            path_to_use = path
+
+        with rasterio.open(path_to_use) as src:
+            img = src.read()
+            meta = src.meta
+            try:
+                coords = src.lnglat()
+            except Exception:
+                # Cannot read coords
+                coords = None
 
     return img, meta, coords
 
+
 def load_image(
-    data: Union[list[str], list[bytes]],
+    data: Union[list[str]],
     path_type: str,
-    mean: list[float] = None,
-    std: list[float] = None,
-    indices: Union[list[int], None] = None,
+    mean: Optional[list[float]] = None,
+    std: Optional[list[float]] = None,
+    indices: Optional[Union[list[int], None]] = None,
 ):
     """Build an input example by loading images in *file_paths*.
 
@@ -149,10 +195,10 @@ def load_image(
     location_coords = []
 
     for file in data:
-        if isinstance(file, bytes):
-            img, meta, coords = read_geotiff(file_data=file)
-        else:
-            img, meta, coords = read_geotiff(file_path=file, path_type=path_type)
+        # if isinstance(file, bytes):
+        #     img, meta, coords = read_geotiff(file_data=file)
+        # else:
+        img, meta, coords = read_geotiff(file_path=file, path_type=path_type)
         # Rescaling (don't normalize on nodata)
         img = np.moveaxis(img, 0, -1)  # channels last for rescaling
         if indices is not None:
@@ -173,14 +219,11 @@ def load_image(
                 if len(julian_day) == 3:
                     julian_day = int(julian_day)
                 else:
-                    julian_day = (
-                        datetime.datetime.strptime(julian_day, "%m%d")
-                        .timetuple()
-                        .tm_yday
-                    )
+                    julian_day = (datetime.datetime.strptime(
+                        julian_day, "%m%d").timetuple().tm_yday)
                 temporal_coords.append([year, julian_day])
-        except Exception as e:
-            print(f"Could not extract timestamp for {file} ({e})")
+        except Exception:
+            logger.exception("Could not extract timestamp for %s", file)
 
     imgs = np.stack(imgs, axis=0)  # num_frames, H, W, C
     imgs = np.moveaxis(imgs, -1, 0).astype("float32")  # C, num_frames, H, W
@@ -188,10 +231,11 @@ def load_image(
 
     return imgs, temporal_coords, location_coords, metas
 
+
 class PrithviMultimodalDataProcessor(IOProcessor):
-            
+
     def __init__(self, vllm_config: VllmConfig):
-        
+
         super().__init__(vllm_config)
 
         self.datamodule = Sen1Floods11NonGeoDataModule(
@@ -209,52 +253,52 @@ class PrithviMultimodalDataProcessor(IOProcessor):
         self.original_w = 512
         self.batch_size = 1
         self.meta_data = None
-        self.channels = None
-        self.requests_cache: Dict[str, Any] = {}
+        self.requests_cache: dict[str, dict[str, Any]] = {}
         self.indices = DEFAULT_INPUT_INDICES
 
-    def parse_request(
-            self, request: Any) -> Optional[Any]:
-        if type(request) == dict:
+    def parse_request(self, request: Any) -> IOProcessorInput:
+        if type(request) is dict:
             image_prompt = ImagePrompt(**request)
             return image_prompt
-        if isinstance(request, IOProcessorPluginRequest):
+        if isinstance(request, IOProcessorRequest):
             if not hasattr(request, "data"):
-                raise ValueError("missing 'data' field in OpenAIBaseModel Request")
-            
+                raise ValueError(
+                    "missing 'data' field in OpenAIBaseModel Request")
+
             request_data = request.data
 
-            if type(request_data) == dict:
+            if type(request_data) is dict:
                 return ImagePrompt(**request_data)
             else:
                 raise ValueError("Unable to parse the request data")
-            
-        
+
         raise ValueError("Unable to parse request")
 
-    def plugin_out_to_response(self, plugin_out: Any) -> IOProcessorPluginResponse:
-        return IOProcessorPluginResponse(
-            request_id = plugin_out.request_id,
-            data=plugin_out,
+    def output_to_response(
+            self, plugin_output: IOProcessorOutput) -> IOProcessorResponse:
+        return IOProcessorResponse(
+            request_id=plugin_output.request_id,
+            data=plugin_output,
         )
 
     def pre_process(
         self,
-        prompt: Any,
+        prompt: IOProcessorInput,
         request_id: Optional[str] = None,
         **kwargs,
     ) -> Union[PromptType, Sequence[PromptType]]:
 
         image_data = dict(prompt)
 
-        self.requests_cache[request_id] = {
-            "out_format": image_data["out_data_format"],
-        }
+        if request_id:
+            self.requests_cache[request_id] = {
+                "out_format": image_data["out_data_format"],
+            }
 
         input_data, temporal_coords, location_coords, meta_data = load_image(
             data=[image_data["data"]],
             indices=self.indices,
-            path_type=image_data["data_format"]
+            path_type=image_data["data_format"],
         )
 
         self.meta_data = meta_data[0]
@@ -262,27 +306,32 @@ class PrithviMultimodalDataProcessor(IOProcessor):
         if input_data.mean() > 1:
             input_data = input_data / 10000  # Convert to range 0-1
 
-        self.channels = [
-            datamodule_config["bands"].index(b) for b in ["RED", "GREEN", "BLUE"]
-        ]  # BGR -> RGB
-
         self.original_h, self.original_w = input_data.shape[-2:]
-        pad_h = (self.img_size - (self.original_h % self.img_size)) % self.img_size
-        pad_w = (self.img_size - (self.original_w % self.img_size)) % self.img_size
+        pad_h = (self.img_size -
+                 (self.original_h % self.img_size)) % self.img_size
+        pad_w = (self.img_size -
+                 (self.original_w % self.img_size)) % self.img_size
         input_data = np.pad(
-            input_data, ((0, 0), (0, 0), (0, 0), (0, pad_h), (0, pad_w)), mode="reflect"
+            input_data,
+            ((0, 0), (0, 0), (0, 0), (0, pad_h), (0, pad_w)),
+            mode="reflect",
         )
 
-    
         batch = torch.tensor(input_data)
-        windows = batch.unfold(3, self.img_size, self.img_size).unfold(4, self.img_size, self.img_size)
+        windows = batch.unfold(3, self.img_size,
+                               self.img_size).unfold(4, self.img_size,
+                                                     self.img_size)
         self.h1, self.w1 = windows.shape[3:5]
         windows = rearrange(
-            windows, "b c t h1 w1 h w -> (b h1 w1) c t h w", h=self.img_size, w=self.img_size
+            windows,
+            "b c t h1 w1 h w -> (b h1 w1) c t h w",
+            h=self.img_size,
+            w=self.img_size,
         )
 
         # Split into batches if number of windows > batch_size
-        num_batches = windows.shape[0] // self.batch_size if windows.shape[0] > self.batch_size else 1
+        num_batches = (windows.shape[0] // self.batch_size
+                       if windows.shape[0] > self.batch_size else 1)
         windows = torch.tensor_split(windows, num_batches, dim=0)
 
         if temporal_coords:
@@ -296,49 +345,44 @@ class PrithviMultimodalDataProcessor(IOProcessor):
 
         prompts = []
         for window in windows:
-        # Apply standardization
-            window = self.datamodule.test_transform(image=window.squeeze().numpy().transpose(1, 2, 0))
+            # Apply standardization
+            window = self.datamodule.test_transform(
+                image=window.squeeze().numpy().transpose(1, 2, 0))
             window = self.datamodule.aug(window)["image"]
-            prompts.append(
-                {
-                    "prompt_token_ids": [1],
-                    "multi_modal_data": {
-                        "pixel_values": window.to(torch.float16)[0],
-                        "location_coords": location_coords.to(torch.float16)
-                    }
-                }
-            )
+            prompts.append({
+                "prompt_token_ids": [1],
+                "multi_modal_data": {
+                    "pixel_values": window.to(torch.float16)[0],
+                    "location_coords": location_coords.to(torch.float16),
+                },
+            })
 
         return prompts
 
-    async def pre_process_async(
-        self,
-        prompt: Any,
-        request_id: Optional[str] = None,
-        **kwargs,
-    ) -> Union[PromptType, Sequence[PromptType]]:
-        return self.pre_process(prompt, request_id, **kwargs)
-    
     def post_process(
         self,
-        model_out: Sequence[Optional[PoolingRequestOutput]],
+        model_output: Sequence[PoolingRequestOutput],
         request_id: Optional[str] = None,
         **kwargs,
-    ) -> Any:
+    ) -> IOProcessorOutput:
 
-        pred_imgs = []
+        pred_imgs_list = []
 
-        out_format = self.requests_cache.get(request_id)["out_format"]
+        if request_id and (request_id in self.requests_cache):
+            out_format = self.requests_cache[request_id]["out_format"]
+        else:
+            out_format = "b64_json"
 
-        for output in model_out:
+        for output in model_output:
             y_hat = output.outputs.data.argmax(dim=1)
-            pred = torch.nn.functional.interpolate(y_hat.unsqueeze(1).float(),
-                                               size=self.img_size,
-                                               mode="nearest",)
-            pred_imgs.append(pred) 
+            pred = torch.nn.functional.interpolate(
+                y_hat.unsqueeze(1).float(),
+                size=self.img_size,
+                mode="nearest",
+            )
+            pred_imgs_list.append(pred)
 
-
-        pred_imgs = torch.concat(pred_imgs, dim=0)
+        pred_imgs: torch.Tensor = torch.concat(pred_imgs_list, dim=0)
 
         # Build images from patches
         pred_imgs = rearrange(
@@ -352,38 +396,19 @@ class PrithviMultimodalDataProcessor(IOProcessor):
             w1=self.w1,
         )
 
-
         # Cut padded area back to original size
         pred_imgs = pred_imgs[..., :self.original_h, :self.original_w]
 
         # Squeeze (batch size 1)
         pred_imgs = pred_imgs[0]
 
+        if not self.meta_data:
+            raise ValueError("No metadata available for the current task")
         self.meta_data.update(count=1, dtype="uint8", compress="lzw", nodata=0)
-        out_data = save_geotiff(_convert_np_uint8(pred_imgs), self.meta_data, out_format)
+        out_data = save_geotiff(_convert_np_uint8(pred_imgs), self.meta_data,
+                                out_format)
 
-        return ImageRequestOutput(type=out_format, format="tiff", data=out_data, request_id=request_id)
-
-    async def post_process_async(
-        self,
-        model_out: Sequence[Optional[PoolingRequestOutput]],
-        request_id: Optional[str] = None,
-        **kwargs,
-    ) -> Any:
-        return self.post_process(model_out, request_id, **kwargs)
-
-class PrithviMultimodalDataProcessorIndia(PrithviMultimodalDataProcessor):
-
-    def __init__(self, vllm_config: VllmConfig):
-        
-        super().__init__(vllm_config)
-
-        self.indices = [1, 2, 3, 8, 11, 12]
-
-class PrithviMultimodalDataProcessorValencia(PrithviMultimodalDataProcessor):
-
-    def __init__(self, vllm_config: VllmConfig):
-        
-        super().__init__(vllm_config)
-        
-        self.indices = [0, 1, 2, 3, 4, 5]
+        return ImageRequestOutput(type=out_format,
+                                  format="tiff",
+                                  data=out_data,
+                                  request_id=request_id)

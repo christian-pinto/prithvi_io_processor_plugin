@@ -4,8 +4,7 @@ description = "vLLM plugin for Multimodal Data Processing"
 dynamic = ["version"]
 
 [project.entry-points."vllm.io_processor_plugins"]
-prithvi_to_tiff_india = "geospatial_output_processor:register_prithvi_india"
-prithvi_to_tiff_valencia = "geospatial_output_processor:register_prithvi_valencia"
+prithvi_to_tiff = "geospatial_output_processor:register_prithvi"
 
 [tool.setuptools.packages.find]
 where = ["."]  # list of folders that contain the packages (["."] by default)
