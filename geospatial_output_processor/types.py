@@ -3,9 +3,21 @@
 
 from typing import Any, Literal, Optional, Union
 
+import albumentations
 from pydantic import BaseModel
 from typing_extensions import TypedDict
 
+class DataModuleConfig(TypedDict):
+    bands: list[str]
+    batch_size: int
+    constant_scale: float
+    data_root: str
+    drop_last: bool
+    no_data_replace: float
+    no_label_replace: int
+    num_workers: int
+    test_transform: list[
+        albumentations.core.transforms_interface.BasicTransform]
 
 class ImagePrompt(BaseModel):
 
