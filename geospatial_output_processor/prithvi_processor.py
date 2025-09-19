@@ -26,7 +26,7 @@ from vllm.plugins.io_processors.interface import (IOProcessor,
                                                   IOProcessorInput,
                                                   IOProcessorOutput)
 
-from .types import DataModuleConfig, ImagePrompt, ImageRequestOutput
+from .types import ImagePrompt, ImageRequestOutput
 
 logger = init_logger(__name__)
 
@@ -37,33 +37,63 @@ PERCENTILE = 99
 
 DEFAULT_INPUT_INDICES = [0, 1, 2, 3, 4, 5]
 
-datamodule_config: DataModuleConfig = {
-    "bands": ["BLUE", "GREEN", "RED", "NIR_NARROW", "SWIR_1", "SWIR_2"],
-    "batch_size":
-    16,
-    "constant_scale":
-    0.0001,
-    "data_root":
-    "/dccstor/geofm-finetuning/datasets/sen1floods11",
-    "drop_last":
-    True,
-    "no_data_replace":
-    0.0,
-    "no_label_replace":
-    -1,
-    "num_workers":
-    8,
-    "test_transform": [
-        albumentations.Resize(always_apply=False,
-                              height=448,
-                              interpolation=1,
-                              p=1,
-                              width=448),
-        albumentations.pytorch.ToTensorV2(transpose_mask=False,
-                                          always_apply=True,
-                                          p=1.0),
-    ],
-}
+import copy
+import importlib
+from typing import Any
+from torchgeo.datamodules.geo import BaseDataModule
+
+def get_class_from_path(class_path: str) -> Any:
+    class_parts = class_path.split('.')
+    module_name = '.'.join(class_parts[:-1])
+    class_path = class_parts[-1]
+
+    # Import the module
+    module = importlib.import_module(module_name)
+
+    # Get the class
+    cls = getattr(module, class_path)
+
+    return cls
+
+def generate_datamodule(datamodule_args: dict[str: Any]) -> BaseDataModule:
+
+    init_args = datamodule_args["init_args"]
+    datamodule_class_path = datamodule_args["class_path"]
+
+    resolved_init_args = copy.deepcopy(init_args)
+
+    if "test_transform" in init_args and init_args["test_transform"]:
+        test_transforms = []
+        for tt in init_args["test_transform"]:
+            tt_class = get_class_from_path(tt["class_path"])
+            init_args = tt["init_args"] if "init_args" in tt else {}
+            test_transforms.append(tt_class(**init_args))
+
+        resolved_init_args["test_transform"] = test_transforms
+
+    if "train_transform" in init_args and init_args["train_transform"]:
+        train_transforms = []
+        for tt in init_args["train_transform"]:
+            tt_class = get_class_from_path(tt["class_path"])
+            init_args = tt["init_args"] if "init_args" in tt else {}
+            train_transforms.append(tt_class(**init_args))
+
+        resolved_init_args["train_transform"] = train_transforms
+
+    if "val_transform" in init_args and init_args["val_transform"]:
+        val_transforms = []
+        for tt in init_args["val_transform"]:
+            tt_class = get_class_from_path(tt["class_path"])
+            init_args = tt["init_args"] if "init_args" in tt else {}
+            val_transforms.append(tt_class(**init_args))
+
+        resolved_init_args["val_transform"] = val_transforms
+
+    print(resolved_init_args)
+    datamodule_class = get_class_from_path(datamodule_class_path)
+    datamodule = datamodule_class(**resolved_init_args)
+
+    return datamodule
 
 
 def save_geotiff(image: torch.Tensor, meta: dict,
@@ -235,14 +265,9 @@ class PrithviMultimodalDataProcessor(IOProcessor):
 
         super().__init__(vllm_config)
 
-        self.datamodule = Sen1Floods11NonGeoDataModule(
-            data_root=datamodule_config["data_root"],
-            batch_size=datamodule_config["batch_size"],
-            num_workers=datamodule_config["num_workers"],
-            bands=datamodule_config["bands"],
-            drop_last=datamodule_config["drop_last"],
-            test_transform=datamodule_config["test_transform"],
-        )
+        model_config = vllm_config.model_config.hf_config.to_dict()["pretrained_cfg"]
+
+        self.datamodule = generate_datamodule(model_config["data"])
         self.img_size = 512
         self.h1 = 1
         self.w1 = 1
@@ -251,7 +276,6 @@ class PrithviMultimodalDataProcessor(IOProcessor):
         self.batch_size = 1
         self.meta_data = None
         self.requests_cache: dict[str, dict[str, Any]] = {}
-        self.indices = DEFAULT_INPUT_INDICES
 
     def parse_request(self, request: Any) -> IOProcessorInput:
         if type(request) is dict:
@@ -292,9 +316,11 @@ class PrithviMultimodalDataProcessor(IOProcessor):
                 "out_format": image_data["out_data_format"],
             }
 
+        indices = DEFAULT_INPUT_INDICES if not image_data["indices"] else image_data["indices"]
+
         input_data, temporal_coords, location_coords, meta_data = load_image(
             data=[image_data["data"]],
-            indices=self.indices,
+            indices=indices,
             path_type=image_data["data_format"],
         )
 
